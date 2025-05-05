@@ -1,0 +1,5 @@
+flask
+flask_sqlalchemy
+flask_login
+mysqlclient  # ou pymysql si mysqlclient ne fonctionne pas
+python-dotenv  # optionnel, pour gérer les variables d'environnement
