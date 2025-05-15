@@ -14,6 +14,8 @@ class User(db.Model, UserMixin):
     email = db.Column(db.String(255), nullable=False, unique=True)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.Enum(Role), nullable=False, default=Role.USER)
+    position = db.Column(db.String(255), nullable=False)
+    direction = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
     # Define the relationship with Answer
@@ -36,6 +38,9 @@ class Project(db.Model):
     image_path = db.Column(db.String(200))
     answers = db.relationship('Answer', backref='project', lazy=True)
 
+    users = db.relationship("ProjectUser", back_populates="project", cascade="all, delete-orphan")
+
+
     def __repr__(self):
         return f'<Project {self.title}>'
 
@@ -46,6 +51,28 @@ class Project(db.Model):
             "description": self.description
             #"answers_count": len(self.answers)  # Include the number of answers, or other relevant fields
         }
+
+class ProjectUser(db.Model):
+
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey("project.id", ondelete="CASCADE"))
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    name = db.Column(db.String(255), nullable=False)
+    position = db.Column(db.String(255))
+    direction = db.Column(db.String(255))
+    is_team_lead = db.Column(db.Boolean, default=False)
+
+    project = db.relationship("Project", back_populates="users")
+
+
+
+
+
+
+
+
+
+
 
 class Question(db.Model):
     id = db.Column(db.Integer, primary_key=True)

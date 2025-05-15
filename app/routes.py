@@ -1,48 +1,155 @@
 from flask import render_template, url_for, redirect, request, flash, jsonify
 from flask_login import login_user, logout_user, login_required, current_user
 from app import app, db
-from app.models import User, Project, Answer, Question
+from app.models import User, Project, Answer, Question, ProjectUser
 from werkzeug.security import generate_password_hash, check_password_hash
 import logging
 from flask import jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models import Project, Question, Answer
+import json
 
 from flask_jwt_extended import create_access_token
 
+from flask import request, jsonify
+import boto3
+import uuid
+import os
+
+
+from flask import request, jsonify
+from flask_jwt_extended import create_access_token, set_access_cookies
+from flask_cors import cross_origin
+
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION')  # e.g. 'us-east-1'
+)
+
+BUCKET = os.getenv('AWS_S3_BUCKET_NAME')
+
+
 # Admin route to create a project
-@app.route('/admin/project/create', methods=['POST'])
-#@login_required
+@app.route("/admin/project/create", methods=["POST"])
 def create_project():
-    #if current_user.role.value != 'admin':
-        #flash('You do not have permission to create projects.', 'danger')
-        #return jsonify({"error": "you are not an admin"})
+    title = request.form.get("title")
+    description = request.form.get("description")
+    #file_path = request.form.get("image_path")
+    team_leader_id = request.form.get("team_leader_id")
+    team_member_ids_raw = request.form.get("team_member_ids")  # if sent as JSON string
 
-    data = request.get_json()
-    title = data.get('title')
-    description = data.get('description')
+    image_file = request.files.get('image')
+    image_url = request.form.get('imageUrl')
+    s3_url = None
 
-    project = Project(title=title, description=description)
+    if image_file:
+        # Generate a unique filename and upload to S3
+        extension = os.path.splitext(image_file.filename)[1]
+        s3_filename = f'project_images/{uuid.uuid4()}{extension}'
+
+        s3.upload_fileobj(
+            image_file,
+            BUCKET,
+            s3_filename,
+            ExtraArgs={"ContentType": image_file.content_type}
+        )
+
+        s3_url = f'https://{BUCKET}.s3.amazonaws.com/{s3_filename}'
+
+    elif image_url:
+        s3_url = image_url
+
+
+
+
+
+
+    if not title or not team_leader_id:
+        return jsonify({"error": "Title and team_leader_id are required"}), 400
+
+    # Parse team member IDs
+    try:
+        team_member_ids = json.loads(team_member_ids_raw) if team_member_ids_raw else []
+    except Exception:
+        return jsonify({"error": "Invalid team_member_ids format"}), 400
+
+    # Get all users involved
+    all_user_ids = [team_leader_id] + team_member_ids
+    users = User.query.filter(User.id.in_(all_user_ids)).all()
+    user_map = {user.id: user for user in users}
+
+    if len(users) != len(set(all_user_ids)):
+        return jsonify({"error": "One or more user IDs are invalid"}), 400
+
+    # Create the project
+    project = Project(title=title, description=description, image_path=s3_url)
     db.session.add(project)
+    db.session.flush()
+
+    # Add team leader
+    leader = user_map[int(team_leader_id)]
+    db.session.add(ProjectUser(
+        project_id=project.id,
+        user_id=leader.id,
+        name=leader.username,
+        position=leader.position,
+        direction=leader.direction,
+        is_team_lead=True
+    ))
+
+    # Add team members
+    for member_id in team_member_ids:
+        member = user_map[member_id]
+        db.session.add(ProjectUser(
+            project_id=project.id,
+            user_id=member.id,
+            name=member.username,
+            position=member.position,
+            direction=member.direction,
+            is_team_lead=False
+        ))
+
     db.session.commit()
 
-    return jsonify({'message': 'Project created successfully!'}), 201
+    return jsonify({"message": "Project created successfully", "id": project.id}), 201
 
 
 # Admin route to get all projects
-@app.route('/admin/projects', methods=['GET'])
-#@login_required
-def admin_projects():
-    #if current_user.role.value != 'admin':
-        #flash('You do not have permission to view projects.', 'danger')
-        #return jsonify({"error": "you are not an admin"})
 
+@app.route("/admin/projects", methods=["GET"])
+def get_projects():
     projects = Project.query.all()
-    return jsonify([project.to_dict() for project in projects])
+    output = []
+    for project in projects:
+        output.append({
+            "id": str(project.id),
+            "title": project.title,
+            "description": project.description,
+            "image_path": project.image_path,
+
+            "users": [
+                {
+                    "name": user.name,
+                    "position": user.position,
+                    "direction": user.direction,
+                    "is_team_lead": user.is_team_lead,
+                }
+                for user in project.users
+            ]
+        })
+    return jsonify(output)
+
+
+
+
+
 
 @app.route('/projects/all', methods=['GET'])
 @jwt_required()
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def projects_with_evaluation_status():
     user_id = get_jwt_identity()
     projects = Project.query.all()
@@ -77,7 +184,9 @@ def get_users():
             "id": user.id,
             "username": user.username,
             "email": user.email,
-            "role": user.role.value
+            "role": user.role.value,
+            "position": user.position,
+            "direction": user.direction
         } for user in users
     ])
 
@@ -100,6 +209,7 @@ logger = logging.getLogger(__name__)
 
 @app.route('/evaluate/<int:project_id>', methods=['POST'])
 @jwt_required()
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def evaluate_project(project_id):
     user_id = get_jwt_identity()
     logger.info(f"Received evaluation request for project ID: {project_id} from user ID: {user_id}")
@@ -245,7 +355,7 @@ def project_question_analysis():
 
 # Route to get all projects and their evaluation (answers)
 @app.route('/projects', methods=['GET'])
-def get_projects():
+def get_projects_evaluations():
     projects = Project.query.all()
     project_data = []
     for project in projects:
@@ -266,11 +376,13 @@ def register():
     email = data.get('email')
     #password = generate_password_hash(data.get('password'))
     password = data.get('password')
+    position = data.get('position')
+    direction = data.get('direction')
 
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email is already in use."}), 400
 
-    user = User(username=username, email=email, password_hash=password)
+    user = User(username=username, email=email, password_hash=password, position = position, direction = direction)
     db.session.add(user)
     db.session.commit()
 
@@ -279,8 +391,47 @@ def register():
     return jsonify({'message': 'User registered successfully!', "email": user.email}), 201
 
 
+@app.route("/projects/<int:project_id>/team", methods=["GET"])
+def get_project_team(project_id):
+    project_users = ProjectUser.query.filter_by(project_id=project_id).all()
+
+    if not project_users:
+        return jsonify({"error": "Project not found or no team assigned"}), 404
+
+    team_leader = None
+    team_members = []
+
+    for pu in project_users:
+        user_info = {
+            "name": pu.name,
+            "position": pu.position,
+            "direction": pu.direction,
+        }
+        if pu.is_team_lead:
+            team_leader = user_info
+        else:
+            team_members.append(user_info)
+
+    return jsonify({
+        "team_leader": team_leader,
+        "team_members": team_members
+    }), 200
+
+
+
+
+
+
 # Route for user login
+
+
+
+
+
+
+
 @app.route('/api/login', methods=['POST'])
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def login():
     data = request.get_json()
     email = data.get("email")
@@ -292,18 +443,22 @@ def login():
         return jsonify({"error": "Invalid credentials"}), 401
 
     access_token = create_access_token(
-        identity=str(user.id),  # must be string
+        identity=str(user.id),
         additional_claims={"role": user.role.value}
     )
-    return jsonify({"access_token": access_token ,'user_role': user.role.value})
 
-# Route to logout the user
-@app.route('/logout', methods=['GET'])
-@login_required
-def logout():
-    logout_user()
-    return jsonify({'message': 'Logout successful!'}), 200
+    response = jsonify({
+        "msg": "Login successful",
+        "user_role": user.role.value  # OK to return role or other metadata
+    })
 
+    set_access_cookies(response, access_token)  # ✅ Secure, HttpOnly, SameSite=None, etc.
+
+    return response, 200
+
+
+
+g
 
 @app.route('/whoami', methods=['GET'])
 def whoami():
@@ -315,3 +470,14 @@ def whoami():
         })
     else:
         return jsonify({"error": "Not logged in"}), 401
+
+
+from flask import jsonify
+from flask_jwt_extended import unset_jwt_cookies
+
+@app.route('/logout', methods=['POST'])
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def logout():
+    response = jsonify({"msg": "Logged out"})
+    unset_jwt_cookies(response)
+    return response, 200
