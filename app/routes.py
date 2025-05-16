@@ -5,7 +5,7 @@ from app.models import User, Project, Answer, Question, ProjectUser
 from werkzeug.security import generate_password_hash, check_password_hash
 import logging
 from flask import jsonify, request
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_request, get_jwt
 from app import db
 from app.models import Project, Question, Answer
 import json
@@ -449,7 +449,11 @@ def login():
 
     response = jsonify({
         "msg": "Login successful",
-        "user_role": user.role.value  # OK to return role or other metadata
+        "user_role": user.role.value,
+        # OK to return role or other metadata
+        "username": user.username,
+        "email": user.email
+
     })
 
     set_access_cookies(response, access_token)  # ✅ Secure, HttpOnly, SameSite=None, etc.
@@ -457,8 +461,32 @@ def login():
     return response, 200
 
 
+@app.route('/api/verify-token', methods=['GET'])
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def verify_token():
+    try:
+        # Verify the JWT token from cookies
+        verify_jwt_in_request(locations=["cookies"])
 
-g
+        # If we get here, the JWT is valid
+        current_user_id = get_jwt_identity()
+        claims = get_jwt()
+
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify({
+            "authenticated": True,
+            "userId": current_user_id,
+            "user_role": claims.get("role", "user")
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 401
+
+
+
+
 
 @app.route('/whoami', methods=['GET'])
 def whoami():
