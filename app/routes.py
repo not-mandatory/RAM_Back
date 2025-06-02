@@ -165,7 +165,8 @@ def projects_with_evaluation_status():
             "id": project.id,
             "title": project.title,
             "description": project.description,
-            "already_evaluated": already_evaluated
+            "already_evaluated": already_evaluated,
+            "image_path": project.image_path
         })
 
     return jsonify(response)
@@ -186,7 +187,8 @@ def get_users():
             "email": user.email,
             "role": user.role.value,
             "position": user.position,
-            "direction": user.direction
+            "direction": user.direction,
+            "createdAt": user.created_at
         } for user in users
     ])
 
@@ -479,7 +481,9 @@ def verify_token():
         return jsonify({
             "authenticated": True,
             "userId": current_user_id,
-            "user_role": claims.get("role", "user")
+            "user_role": claims.get("role", "user"),
+            "name": user.username,
+            "email": user.email
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 401

@@ -48,7 +48,8 @@ class Project(db.Model):
         return {
             "id": self.id,
             "title": self.title,
-            "description": self.description
+            "description": self.description,
+            "image_path": self.image_path
             #"answers_count": len(self.answers)  # Include the number of answers, or other relevant fields
         }
 
