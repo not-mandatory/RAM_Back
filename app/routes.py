@@ -1,82 +1,73 @@
-from flask import render_template, url_for, redirect, request, flash, jsonify
+import os
+import uuid
+
+from flask import render_template, url_for, redirect, request, flash, jsonify, current_app
 from flask_login import login_user, logout_user, login_required, current_user
-from app import app, db
-from app.models import User, Project, Answer, Question, ProjectUser
-from werkzeug.security import generate_password_hash, check_password_hash
+from app import app, db, s3, BUCKET
+from app.DistilBert.classify import classify
+from app.models import User, Project, Answer, ProjectUser, Idea
 import logging
-from flask import jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_request, get_jwt
 from app import db
-from app.models import Project, Question, Answer
+from app.models import Project, Answer
 import json
 
-from flask_jwt_extended import create_access_token
 
 from flask import request, jsonify
-import boto3
-import uuid
-import os
+
 
 
 from flask import request, jsonify
 from flask_jwt_extended import create_access_token, set_access_cookies
 from flask_cors import cross_origin
 
-s3 = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.getenv('AWS_REGION')  # e.g. 'us-east-1'
-)
-
-BUCKET = os.getenv('AWS_S3_BUCKET_NAME')
+from app.utils.notifications import create_notification_for_admins, logger
 
 
-# Admin route to create a project
 @app.route("/admin/project/create", methods=["POST"])
 def create_project():
     title = request.form.get("title")
     description = request.form.get("description")
-    #file_path = request.form.get("image_path")
     team_leader_id = request.form.get("team_leader_id")
-    team_member_ids_raw = request.form.get("team_member_ids")  # if sent as JSON string
+    team_member_ids_raw = request.form.get("team_member_ids")
 
     image_file = request.files.get('image')
     image_url = request.form.get('imageUrl')
     s3_url = None
 
     if image_file:
-        # Generate a unique filename and upload to S3
         extension = os.path.splitext(image_file.filename)[1]
         s3_filename = f'project_images/{uuid.uuid4()}{extension}'
 
-        s3.upload_fileobj(
-            image_file,
-            BUCKET,
-            s3_filename,
-            ExtraArgs={"ContentType": image_file.content_type}
-        )
+        # --- Use the imported BUCKET variable ---
+        if not BUCKET: # Add a final check just in case
+            current_app.logger.error("AWS_S3_BUCKET_NAME is not set in .env or app configuration.")
+            return jsonify({"error": "S3 bucket name not configured"}), 500
 
-        s3_url = f'https://{BUCKET}.s3.amazonaws.com/{s3_filename}'
+        try:
+            s3.upload_fileobj(
+                image_file,
+                BUCKET, # This should now be a string from your .env
+                s3_filename,
+                ExtraArgs={"ContentType": image_file.content_type}
+            )
+            s3_url = f'https://{BUCKET}.s3.amazonaws.com/{s3_filename}'
+        except Exception as e:
+            current_app.logger.error(f"Error uploading file to S3: {e}")
+            return jsonify({"error": f"Failed to upload image to S3: {str(e)}"}), 500
+
 
     elif image_url:
         s3_url = image_url
 
-
-
-
-
-
     if not title or not team_leader_id:
         return jsonify({"error": "Title and team_leader_id are required"}), 400
 
-    # Parse team member IDs
     try:
         team_member_ids = json.loads(team_member_ids_raw) if team_member_ids_raw else []
-    except Exception:
+    except json.JSONDecodeError: # More specific error handling
         return jsonify({"error": "Invalid team_member_ids format"}), 400
 
-    # Get all users involved
     all_user_ids = [team_leader_id] + team_member_ids
     users = User.query.filter(User.id.in_(all_user_ids)).all()
     user_map = {user.id: user for user in users}
@@ -84,31 +75,22 @@ def create_project():
     if len(users) != len(set(all_user_ids)):
         return jsonify({"error": "One or more user IDs are invalid"}), 400
 
-    # Create the project
     project = Project(title=title, description=description, image_path=s3_url)
     db.session.add(project)
     db.session.flush()
 
-    # Add team leader
     leader = user_map[int(team_leader_id)]
     db.session.add(ProjectUser(
         project_id=project.id,
         user_id=leader.id,
-        name=leader.username,
-        position=leader.position,
-        direction=leader.direction,
         is_team_lead=True
     ))
 
-    # Add team members
     for member_id in team_member_ids:
         member = user_map[member_id]
         db.session.add(ProjectUser(
             project_id=project.id,
             user_id=member.id,
-            name=member.username,
-            position=member.position,
-            direction=member.direction,
             is_team_lead=False
         ))
 
@@ -118,28 +100,46 @@ def create_project():
 
 
 # Admin route to get all projects
+from flask import request, jsonify
+# Assuming Project, User, ProjectUser, and db are imported from your app setup
+from app import app, db # Assuming app and db are defined in app.py
+from app.models import Project, User, ProjectUser # Assuming your models are here
 
 @app.route("/admin/projects", methods=["GET"])
 def get_projects():
+    # Fetch all projects
     projects = Project.query.all()
     output = []
+
     for project in projects:
+        project_users_data = []
+
+        # Query for ProjectUser entries related to the current project
+        # and eagerly load the associated User object by joining ProjectUser with User
+        project_users = db.session.query(ProjectUser, User).\
+                        join(User, ProjectUser.user_id == User.id).\
+                        filter(ProjectUser.project_id == project.id).\
+                        all() # This returns tuples of (ProjectUser, User)
+
+        for pu, user in project_users:
+            # 'pu' is the ProjectUser instance (for is_team_lead)
+            # 'user' is the User instance (for username, position, direction)
+            project_users_data.append({
+                "name": user.username,        # Fetched from the joined User table
+                "position": user.position,    # Fetched from the joined User table
+                "direction": user.direction,  # Fetched from the joined User table
+                "is_team_lead": pu.is_team_lead, # Fetched from the ProjectUser table
+            })
+
         output.append({
             "id": str(project.id),
             "title": project.title,
             "description": project.description,
             "image_path": project.image_path,
-
-            "users": [
-                {
-                    "name": user.name,
-                    "position": user.position,
-                    "direction": user.direction,
-                    "is_team_lead": user.is_team_lead,
-                }
-                for user in project.users
-            ]
+            "users": project_users_data # This now contains the complete user details
         })
+
+
     return jsonify(output)
 
 
@@ -206,21 +206,78 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 
 
 
-# Set up logger
-logger = logging.getLogger(__name__)
+@app.route('/api/idea/submit', methods=['POST'])
+@jwt_required()
+def submit_idea():
+    data = request.get_json()
+    description = data.get("description")
+    title = data.get("title")
+    category = data.get("category")
+    user_id = get_jwt_identity()
+
+    if not description or not title or not category:
+        return jsonify({"error": "Title, description, and category are required."}), 400
+
+    try:
+        # Create and save the idea
+        new_idea = Idea(
+            title=title,
+            description=description,
+            category=category,
+            status='pending',
+            user_id=user_id
+        )
+        db.session.add(new_idea)
+        db.session.flush()  # Get the ID without committing
+
+        # Get user info for notification
+        user = User.query.get(user_id)
+
+        # Create notifications for all admins
+        create_notification_for_admins(
+            title="New Idea Submitted",
+            message=f"{user.username} submitted a new idea: '{title}'",
+            notification_type="info",
+            related_id=new_idea.id
+        )
+
+        db.session.commit()
+
+        # Send real-time notification to admin room
+        socketio.emit('new_notification', {
+            'title': 'New Idea Submitted',
+            'message': f"{user.username} submitted a new idea: '{title}'",
+            'type': 'info',
+            'idea_id': new_idea.id,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room='admin_room')
+
+        return jsonify({
+            "message": "Idea submitted successfully",
+            "idea_id": new_idea.id,
+            "status": "success"
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            "error": "Failed to submit idea",
+            "details": str(e)
+        }), 500
+
 
 @app.route('/evaluate/<int:project_id>', methods=['POST'])
 @jwt_required()
 @cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def evaluate_project(project_id):
     user_id = get_jwt_identity()
+    current_user = User.query.get(user_id)
     logger.info(f"Received evaluation request for project ID: {project_id} from user ID: {user_id}")
 
-    existing_answers = Answer.query.filter_by(user_id=user_id, project_id=project_id).first()
-
-    if existing_answers:
+    existing_answer_record = Answer.query.filter_by(user_id=user_id, project_id=project_id).first()
+    if existing_answer_record:
+        logger.warning(f"User {user_id} has already evaluated project {project_id}.")
         return jsonify({"error": "You have already evaluated this project."}), 409
-
 
     try:
         data = request.get_json()
@@ -228,126 +285,213 @@ def evaluate_project(project_id):
             logger.error(f"Missing JSON data in the request for project ID: {project_id}")
             return jsonify({'error': 'No data provided'}), 400
 
-        answers = data.get('answers')
+        q1_answer = data.get('q1')
+        q2_answer = data.get('q2')
+        q3_answer = data.get('q3')
+        q4_answer = data.get('q4')
+        q5_answer = data.get('q5')
 
-        if not answers:
-            logger.error(f"Missing 'answers' in the request data for project ID: {project_id}")
-            return jsonify({'error': 'Answers not provided'}), 400
+        if any(val is None for val in [q1_answer, q2_answer, q3_answer, q4_answer, q5_answer]):
+            logger.error(f"Missing one or more question answers (q1-q5) in request for project ID: {project_id}")
+            return jsonify({'error': 'All answers (q1-q5) are required.'}), 400
 
-        if len(answers) != 5:
-            logger.error(f"Invalid answers count for project ID: {project_id}. Expected 5 answers, got {len(answers)}.")
-            return jsonify({'error': 'Invalid answers count.'}), 400
+        rating_questions = [q1_answer, q2_answer, q3_answer, q4_answer]
+        for idx, rating in enumerate(rating_questions):
+            if not isinstance(rating, int) or not (1 <= rating <= 5):
+                logger.error(f"Invalid rating for q{idx + 1}: {rating} for project ID: {project_id}.")
+                return jsonify({'error': f'Answer for q{idx + 1} must be an integer between 1 and 5.'}), 400
 
-        # Get the project
+        if not isinstance(q5_answer, int) or not (0 <= q5_answer <= 1):
+            logger.error(f"Invalid value for q5: {q5_answer} for project ID: {project_id}. Must be 0 or 1.")
+            return jsonify({'error': 'Answer for q5 must be 0 or 1.'}), 400
+
         project = Project.query.get_or_404(project_id)
         logger.info(f"Found project ID: {project_id} for evaluation.")
 
-        # Iterate over answers and store them in the database
-        for index, answer in enumerate(answers):
-            question = Question.query.filter_by(order=index + 1).first()
-            if not question:
-                logger.error(f"Question not found for index {index + 1} in project ID: {project_id}")
-                return jsonify({'error': f"Question not found for index {index + 1}"}), 404
-
-            # Store answer in the database
-            answer_entry = Answer(user_id=user_id, question_id=question.id, project_id=project.id, answer=answer)
-            db.session.add(answer_entry)
-            logger.info(f"Answer for question {index + 1} stored successfully for project ID: {project_id}")
-
+        answer_entry = Answer(
+            user_id=user_id,
+            project_id=project.id,
+            q1=q1_answer,
+            q2=q2_answer,
+            q3=q3_answer,
+            q4=q4_answer,
+            q5=q5_answer
+        )
+        db.session.add(answer_entry)
         db.session.commit()
-        logger.info(f"Evaluation submitted successfully for project ID: {project_id}.")
+        logger.info(f"Evaluation submitted successfully for project ID: {project_id} by user {user_id}.")
+
+        # --- CREATE NOTIFICATION (ONLY ONCE) ---
+        notification_title = "New Project Evaluation"
+        notification_message = f"Project '{project.title}' was evaluated by user '{current_user.username}'."
+
+        # Create notification in database
+        notification = create_notification_for_admins(
+            title=notification_title,
+            message=notification_message,
+            notification_type="info",
+            related_id=project.id
+        )
+
+        # --- EMIT REAL-TIME SOCKET.IO EVENT TO ADMINS (ONLY ONCE) ---
+        logger.info(f"Emitting notification to admin_room for project {project.id}")
+        socketio.emit(
+            "new_notification",
+            {
+                "title": notification_title,
+                "message": notification_message,
+                "type": "info",
+                "project_id": project.id,  # Changed from idea_id to project_id
+                "timestamp": datetime.utcnow().isoformat()
+            },
+            room="admin_room"
+        )
 
         return jsonify({'message': 'Project evaluated successfully!'}), 200
 
     except Exception as e:
-        # Log unexpected errors
-        logger.error(f"Unexpected error during evaluation of project ID: {project_id} - {str(e)}")
+        db.session.rollback()
+        logger.error(f"Unexpected error during evaluation of project ID: {project_id} - {str(e)}", exc_info=True)
         return jsonify({'error': 'An error occurred while processing the evaluation.'}), 500
 
 
 
-
 # Route to get all answers for a specific question
-@app.route('/answers/question/<int:question_id>', methods=['GET'])
-def get_answers_for_question(question_id):
-    answers = Answer.query.filter_by(question_id=question_id).all()
-    answer_data = [{'user': answer.user.username, 'answer': answer.answer} for answer in answers]
-    return jsonify(answer_data)
+
 
 
 # Route to get all answers for a specific project
 @app.route('/project/<int:project_id>/answers', methods=['GET'])
-#@login_required
+#@login_required # Uncomment if you want to restrict access to logged-in users
 def get_project_answers(project_id):
-    project = Project.query.get_or_404(project_id)
+    # First, check if the project exists. If not, return 404.
+    project = Project.query.get(project_id)
+    if not project:
+        return jsonify({"error": "Project not found."}), 404
 
-    answers = Answer.query.filter_by(project_id=project.id).all()
+    # Query for all Answer records related to this project_id
+    # We join with the User model to fetch the username of the person who evaluated.
+    answers_with_users = db.session.query(Answer, User).\
+                         join(User, Answer.user_id == User.id).\
+                         filter(Answer.project_id == project_id).\
+                         all()
 
     response = []
-    for ans in answers:
+    if not answers_with_users:
+        # If the project exists but has no evaluations yet
+        return jsonify(response), 200 # Return an empty list for no answers
+
+    for ans, user in answers_with_users:
+        # 'ans' is the Answer instance
+        # 'user' is the User instance (from the joined User table)
         response.append({
+            "answer_id": ans.id,      # Include the answer record ID
             "user_id": ans.user_id,
-            "question_id": ans.question_id,
-            "question_text": ans.question.text,
-            "answer": ans.answer
+            "username": user.username, # Get username from the joined User table
+            "q1": ans.q1,             # Directly access the static question columns
+            "q2": ans.q2,
+            "q3": ans.q3,
+            "q4": ans.q4,
+            "q5": ans.q5
         })
 
     return jsonify(response)
 
-
 @app.route('/admin/projects/grouped-evaluations', methods=['GET'])
 def grouped_evaluations():
-    answers = Answer.query.join(User).join(Project).join(Question).order_by(
-        Answer.user_id, Answer.project_id, Question.order
-    ).all()
+    # Query all Answer records.
+    # We join with User to get the evaluator's username.
+    # We join with Project to get the project's title.
+    # The 'Question' join is removed as the model no longer exists.
+    answers_with_details = db.session.query(Answer, User, Project).\
+                           join(User, Answer.user_id == User.id).\
+                           join(Project, Answer.project_id == Project.id).\
+                           order_by(Answer.user_id, Answer.project_id).\
+                           all()
 
-    grouped = {}
-    for ans in answers:
-        key = (ans.user_id, ans.project_id)
-        if key not in grouped:
-            grouped[key] = {
-                "username": ans.user.username,
-                "project_title": ans.project.title,
-                "answers": []
-            }
-        grouped[key]["answers"].append(ans.answer)
+    # This list will hold the final structured evaluations.
+    # Since each 'Answer' record now contains all five static questions (q1-q5),
+    # and your /evaluate endpoint prevents multiple Answer records for the same
+    # user-project combination, each entry in 'answers_with_details' corresponds
+    # to one complete evaluation.
+    grouped_evaluations_list = []
 
-    return jsonify(list(grouped.values()))
+    for ans, user, project in answers_with_details:
+        grouped_evaluations_list.append({
+            "user_id": ans.user_id,          # ID of the user who evaluated
+            "username": user.username,       # Username from the User table
+            "project_id": ans.project_id,    # ID of the project evaluated
+            "project_title": project.title,  # Title from the Project table
+            "answers": [                     # All five answers for this evaluation as an array
+                ans.q1,
+                ans.q2,
+                ans.q3,
+                ans.q4,
+                ans.q5
+            ]
+        })
+
+    return jsonify(grouped_evaluations_list)
 
 
 from sqlalchemy.sql import func
-
 @app.route('/admin/projects/summary', methods=['GET'])
 def project_question_analysis():
+    # Fetch all projects from the database
     projects = Project.query.all()
     response = []
 
     for project in projects:
+        # Retrieve all answer records associated with the current project
+        project_answers = Answer.query.filter_by(project_id=project.id).all()
+
+        # Initialize lists to store the values for each question across all evaluations for this project
+        q1_values = []
+        q2_values = []
+        q3_values = []
+        q4_values = []
+        q5_values = [] # This will store 0s or 1s for the "boolean" question
+
+        # Populate the value lists from each answer record for the current project
+        for ans in project_answers:
+            q1_values.append(ans.q1)
+            q2_values.append(ans.q2)
+            q3_values.append(ans.q3)
+            q4_values.append(ans.q4)
+            q5_values.append(ans.q5) # Assuming q5 is an Integer (0 or 1)
+
+        # --- Calculate Means for Questions 1-4 ---
         mean_qsts = []
+        # Iterate through the lists of values for the first four questions
+        for values_list in [q1_values, q2_values, q3_values, q4_values]:
+            if values_list: # Ensure there are answers before calculating the mean to avoid ZeroDivisionError
+                mean = round(sum(values_list) / len(values_list), 2)
+                mean_qsts.append(mean)
+            else:
+                mean_qsts.append(0.0) # Append 0 if no answers for this specific question
+
+        # --- Calculate Yes/No Counts for Question 5 ---
         yes_count = 0
         no_count = 0
+        if q5_values: # Ensure there are answers for q5
+            yes_count = q5_values.count(1) # Count occurrences of '1'
+            no_count = q5_values.count(0)  # Count occurrences of '0'
 
-        for q_id in range(1, 6):  # assuming 5 questions, last one is boolean
-            answers = Answer.query.filter_by(project_id=project.id, question_id=q_id).all()
-            values = [a.answer for a in answers]
+        # --- Calculate the overall average of the means for questions 1-4 ---
+        # This gives a single average score for the project based on the rating questions.
+        avg_qst = round(sum(mean_qsts) / len(mean_qsts), 2) if mean_qsts else 0.0
 
-            if q_id == 5:  # Boolean question
-                yes_count = values.count(1)
-                no_count = values.count(0)
-            else:
-                mean = round(sum(values) / len(values), 2) if values else 0
-                mean_qsts.append(mean)
-
-        avg_qst = round(sum(mean_qsts) / len(mean_qsts), 2) if mean_qsts else 0
-
+        # Append the calculated summary for the current project to the response list
         response.append({
+            "project_id": project.id,        # Include project ID for clear identification
             "project_title": project.title,
-            "mean_qsts": mean_qsts,
-            "avg_qst": avg_qst,
-            "yes_count": yes_count,
-            "no_count": no_count
+            "mean_qsts": mean_qsts,          # A list of mean scores for Q1, Q2, Q3, Q4
+            "avg_qst": avg_qst,              # The overall average of those means
+            "yes_count": yes_count,          # Count of 'yes' (1) answers for Q5
+            "no_count": no_count             # Count of 'no' (0) answers for Q5
         })
 
+    # Sort the projects by their overall average score (avg_qst) in descending order
     response.sort(key=lambda x: x["avg_qst"], reverse=True)
 
     return jsonify(response)
@@ -356,18 +500,7 @@ def project_question_analysis():
 
 
 # Route to get all projects and their evaluation (answers)
-@app.route('/projects', methods=['GET'])
-def get_projects_evaluations():
-    projects = Project.query.all()
-    project_data = []
-    for project in projects:
-        project_answers = []
-        for question in Question.query.all():
-            answers = Answer.query.filter_by(project_id=project.id, question_id=question.id).all()
-            project_answers.append({'question': question.text, 'answers': [answer.answer for answer in answers]})
-        project_data.append({'project': project.title, 'evaluations': project_answers})
 
-    return jsonify(project_data)
 
 
 # Route to register a new user
@@ -395,19 +528,33 @@ def register():
 
 @app.route("/projects/<int:project_id>/team", methods=["GET"])
 def get_project_team(project_id):
-    project_users = ProjectUser.query.filter_by(project_id=project_id).all()
+    # Query ProjectUser entries for the given project_id
+    # and join with the User table to get user details
+    project_users_with_details = db.session.query(ProjectUser, User).\
+                                 join(User, ProjectUser.user_id == User.id).\
+                                 filter(ProjectUser.project_id == project_id).\
+                                 all()
 
-    if not project_users:
-        return jsonify({"error": "Project not found or no team assigned"}), 404
+    if not project_users_with_details:
+        # Check if the project itself exists, or if there are truly no users
+        # It's better to distinguish between "project not found" and "no team"
+        project_exists = Project.query.get(project_id)
+        if not project_exists:
+            return jsonify({"error": "Project not found"}), 404
+        else:
+            return jsonify({"team_leader": None, "team_members": []}), 200 # Project exists, but no team assigned
 
     team_leader = None
     team_members = []
 
-    for pu in project_users:
+    for pu, user in project_users_with_details:
+        # 'pu' is the ProjectUser instance
+        # 'user' is the User instance (from the joined User table)
         user_info = {
-            "name": pu.name,
-            "position": pu.position,
-            "direction": pu.direction,
+            "id": user.id, # Often useful to include the user's ID
+            "name": user.username,     # Get username from the User table
+            "position": user.position, # Get position from the User table
+            "direction": user.direction, # Get direction from the User table
         }
         if pu.is_team_lead:
             team_leader = user_info
@@ -490,18 +637,38 @@ def verify_token():
 
 
 
+@app.route('/api/idea/analyze', methods=['POST'])
+#@jwt_required()
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def analyze_idea():
+    """Analyze idea and suggest category without saving to database"""
+    data = request.get_json()
+    description = data.get("description")
+    title = data.get("title")
 
 
-@app.route('/whoami', methods=['GET'])
-def whoami():
-    if current_user.is_authenticated:
+    if not description or not title:
+        return jsonify({"error": "Title and description are required."}), 400
+
+    try:
+        # Run classification to get suggested category
+        predicted_category = classify(description)
+
         return jsonify({
-            "user_email": current_user.email,
-            "is_admin": current_user.is_admin(),
-            "current_user.role": current_user.role.value
+            "suggestedCategory": predicted_category,
+            "status": "success"
         })
-    else:
-        return jsonify({"error": "Not logged in"}), 401
+
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to analyze idea",
+            "details": str(e)
+        }), 500
+
+
+
+
+
 
 
 from flask import jsonify
@@ -513,3 +680,214 @@ def logout():
     response = jsonify({"msg": "Logged out"})
     unset_jwt_cookies(response)
     return response, 200
+
+
+
+
+
+@app.route('/api/admin/ideas', methods=['GET'])
+def get_all_ideas():
+    ideas = Idea.query.all()
+
+    ideas_data = []
+    for idea in ideas:
+        ideas_data.append({
+            "id": idea.id,
+            "title": idea.title,
+            "description": idea.description,
+            "category": idea.category,
+            "status": idea.status,
+            "created_at": idea.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "submitted_by": idea.user.username
+        })
+
+    return jsonify(ideas_data), 200
+
+
+
+
+
+
+
+
+
+@app.route('/api/idea/<int:idea_id>', methods=['GET'])
+
+def get_idea_by_id(idea_id):
+    from app.models import Idea
+
+    idea = Idea.query.get(idea_id)
+    if not idea:
+        return jsonify({"error": "Idea not found"}), 404
+
+    return jsonify({
+        "id": idea.id,
+        "title": idea.title,
+        "description": idea.description,
+        "category": idea.category,
+        "submitted_by": idea.user.username,
+        "created_at": idea.created_at
+    }), 200
+
+
+
+
+
+
+
+@app.route('/api/ideas/<int:idea_id>/approve', methods=['POST'])
+def approve_idea(idea_id):
+    idea = Idea.query.get(idea_id)
+    if not idea:
+        return jsonify({'error': 'Idea not found'}), 404
+
+    if idea.status == 'Approved':
+        return jsonify({'message': 'Idea is already approved'}), 200
+
+    idea.status = 'Approved'
+    db.session.commit()
+    return jsonify({'message': 'Idea approved successfully', 'id': idea.id, 'status': idea.status}), 200
+
+
+
+
+
+
+
+
+@app.route('/api/admin/import-users', methods=['POST'])
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def import_users():
+    users = request.get_json() or []
+    created = []
+    errors = []
+    for data in users:
+        # Check for duplicates
+        if User.query.filter((User.username == data['username']) | (User.email == data['email'])).first():
+            errors.append({'username': data['username'], 'email': data['email'], 'error': 'Duplicate'})
+            continue
+        user = User(
+            username=data['username'],
+            email=data['email'],
+            password_hash=data['password'],
+            position=data.get('position', ''),
+            direction=data.get('direction', ''),
+        )
+        db.session.add(user)
+        created.append({'username': data['username'], 'email': data['email']})
+    db.session.commit()
+    return jsonify({'created': created, 'errors': errors}), 201
+
+
+# Add these imports to your existing routes.py
+from flask import request, jsonify
+from flask_jwt_extended import get_jwt_identity, jwt_required
+from datetime import datetime
+from app import app, db, socketio
+from app.models import Idea, User, Notification
+
+
+
+
+
+
+@app.route('/api/notifications', methods=['GET'])
+@jwt_required()
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def get_notifications():
+    user_id = get_jwt_identity()
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+
+    try:
+        notifications = Notification.query.filter_by(user_id=user_id) \
+            .order_by(Notification.created_at.desc()) \
+            .paginate(page=page, per_page=per_page, error_out=False)
+
+        unread_count = Notification.query.filter_by(user_id=user_id, is_read=False).count()
+
+        return jsonify({
+            'notifications': [n.to_dict() for n in notifications.items],
+            'total': notifications.total,
+            'unread_count': unread_count
+        })
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch notifications", "details": str(e)}), 500
+
+
+# Mark notification as read
+@app.route('/api/notifications/<int:notification_id>/read', methods=['PUT'])
+@jwt_required()
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def mark_notification_read(notification_id):
+    user_id = get_jwt_identity()
+
+    try:
+        notification = Notification.query.filter_by(id=notification_id, user_id=user_id).first()
+
+        if not notification:
+            return jsonify({"error": "Notification not found"}), 404
+
+        notification.is_read = True
+        db.session.commit()
+
+        return jsonify({"message": "Notification marked as read"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "Failed to mark notification as read", "details": str(e)}), 500
+
+
+# Mark all notifications as read
+@app.route('/api/notifications/read-all', methods=['PUT'])
+@jwt_required()
+@cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
+def mark_all_notifications_read():
+    user_id = get_jwt_identity()
+
+    try:
+        Notification.query.filter_by(user_id=user_id, is_read=False).update({'is_read': True})
+        db.session.commit()
+
+        return jsonify({"message": "All notifications marked as read"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "Failed to mark all notifications as read", "details": str(e)}), 500
+
+
+# Test notification endpoint (for development)
+@app.route('/api/test-notification', methods=['POST'])
+@jwt_required()
+def test_notification():
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+
+    if not user or user.role != 'admin':
+        return jsonify({"error": "Admin access required"}), 403
+
+    try:
+        # Create test notifications
+        create_notification_for_admins(
+            title="Test Notification",
+            message="This is a test notification to verify the system is working",
+            notification_type="info"
+        )
+
+        # Send real-time test notification
+        socketio.emit('new_notification', {
+            'title': 'Test Notification',
+            'message': 'This is a test notification to verify the system is working',
+            'type': 'info',
+            'timestamp': datetime.utcnow().isoformat()
+        }, room='admin_room')
+
+        return jsonify({"message": "Test notification sent successfully"})
+    except Exception as e:
+        return jsonify({"error": "Failed to send test notification", "details": str(e)}), 500
+
+
+
+
+
+
+
+
