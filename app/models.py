@@ -2,11 +2,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from flask_login import UserMixin
 from app import db
+from datetime import datetime, timezone
 
 # Define role types using Enum
 class Role(Enum):
     ADMIN = 'admin'
-    USER = 'user'
+    ÉVALUATEUR = 'évaluateur'
 
 
 class Notification(db.Model):
@@ -17,7 +18,7 @@ class Notification(db.Model):
     message = db.Column(db.Text, nullable=False)
     type = db.Column(db.String(50), default='info')  # info, success, warning, error
     is_read = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     related_id = db.Column(db.String(100))  # For linking to ideas, projects, etc.
 
     # Relationship
@@ -43,7 +44,7 @@ class User(db.Model, UserMixin):
     username = db.Column(db.String(255), nullable=False, unique=True)
     email = db.Column(db.String(255), nullable=False, unique=True)
     password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.Enum(Role), nullable=False, default=Role.USER)
+    role = db.Column(db.Enum(Role), nullable=False, default=Role.ÉVALUATEUR)
     position = db.Column(db.String(255), nullable=False)
     direction = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
@@ -76,10 +77,11 @@ class Idea(db.Model):
 class Project(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(255), nullable=False)
-    description = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text, nullable=False)
     image_path = db.Column(db.String(200))
-    answers = db.relationship('Answer', backref='project', lazy=True)
+    category = db.Column(db.String(255), nullable=False)
 
+    answers = db.relationship('Answer', backref='project', lazy=True)
     users = db.relationship("ProjectUser", back_populates="project", cascade="all, delete-orphan")
 
 
@@ -91,7 +93,8 @@ class Project(db.Model):
             "id": self.id,
             "title": self.title,
             "description": self.description,
-            "image_path": self.image_path
+            "image_path": self.image_path,
+            "category": self.category
             #"answers_count": len(self.answers)  # Include the number of answers, or other relevant fields
         }
 
@@ -128,17 +131,22 @@ class Question(db.Model):
 
 
 
+# app/models.py (excerpt)
+from datetime import datetime, timezone # Import timezone
+
 class Answer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)     # Link to User
-    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=False)  # Link to Project
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=False)
 
-    # Static question fields
     q1 = db.Column(db.Integer, nullable=False)
     q2 = db.Column(db.Integer, nullable=False)
     q3 = db.Column(db.Integer, nullable=False)
     q4 = db.Column(db.Integer, nullable=False)
-    q5 = db.Column(db.Integer, nullable=False)  # Last question is a boolean
+    q5 = db.Column(db.Integer, nullable=False)
+
+    # Add this new column:
+    created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
 
     def __repr__(self):
         return f'<Answer {self.id}>'

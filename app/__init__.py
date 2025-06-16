@@ -9,6 +9,9 @@ from flask_migrate import Migrate
 from flask_login import LoginManager
 from flask_socketio import SocketIO
 import os
+from flask_mail import Mail
+
+
 
 
 app = Flask(__name__)
@@ -35,6 +38,14 @@ app.config['AWS_ACCESS_KEY_ID'] = os.environ.get('AWS_ACCESS_KEY_ID')
 app.config['AWS_SECRET_ACCESS_KEY'] = os.environ.get('AWS_SECRET_ACCESS_KEY')
 app.config['AWS_S3_BUCKET_NAME'] = os.environ.get('AWS_S3_BUCKET_NAME') # This is your BUCKET
 app.config['AWS_REGION'] = os.environ.get('AWS_REGION', 'us-east-1')
+
+app.config['MAIL_SERVER'] = os.environ.get('MAIL_SERVER', 'smtp.example.com')
+app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', 587))
+app.config['MAIL_USE_TLS'] = os.environ.get('MAIL_USE_TLS', 'True').lower() == 'true'
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
+
+mail = Mail(app)
 
 
 

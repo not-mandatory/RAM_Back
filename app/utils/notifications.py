@@ -17,7 +17,7 @@ def create_notification_for_admins(title, message, notification_type="info", rel
         notifications_created = []
 
         for admin in admins:
-            logger("1, 2, 3")
+
             notification = Notification(
                 user_id=admin.id,
                 title=title,
