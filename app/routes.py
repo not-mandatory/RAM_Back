@@ -915,12 +915,11 @@ def verify_token():
         return jsonify({"error": str(e)}), 401
 
 
-
+"""
 @app.route('/api/idea/analyze', methods=['POST'])
 #@jwt_required()
 @cross_origin(origins=["http://localhost:3000"], supports_credentials=True)
 def analyze_idea():
-    """Analyze idea and suggest category without saving to database"""
     data = request.get_json()
     description = data.get("description")
     title = data.get("title")
@@ -944,7 +943,7 @@ def analyze_idea():
             "details": str(e)
         }), 500
 
-
+"""
 
 
 
@@ -1409,5 +1408,12 @@ def register():
 @app.route("/")
 def home():
     return "Hello, Azure!"
+from sqlalchemy.sql import text
 
-
+@app.route('/db_test')
+def db_test():
+    try:
+        db.session.execute(text('SELECT 1'))
+        return "<h1>Database connection works!</h1>"
+    except Exception as e:
+        return f"<h1>Database connection failed:</h1><p>{e}</p>"
