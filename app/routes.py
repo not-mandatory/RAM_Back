@@ -1406,5 +1406,8 @@ def register():
 
 
 
+@app.route("/")
+def home():
+    return "Hello, Azure!"
 
 
